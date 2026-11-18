@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -24,7 +24,8 @@ import {
 
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
-const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
+// Verbose logging inside godot_operations.gd; off by default because it floods tool results
+const GODOT_DEBUG_MODE: boolean = process.env.GODOT_DEBUG === 'true';
 
 const execFileAsync = promisify(execFile);
 
@@ -77,6 +78,7 @@ class GodotServer {
     'project_path': 'projectPath',
     'scene_path': 'scenePath',
     'root_node_type': 'rootNodeType',
+    'root_node_name': 'rootNodeName',
     'parent_node_path': 'parentNodePath',
     'node_type': 'nodeType',
     'node_name': 'nodeName',
@@ -169,6 +171,23 @@ class GodotServer {
     if (DEBUG_MODE) {
       console.error(`[DEBUG] ${message}`);
     }
+  }
+
+  /**
+   * Strip Godot's startup banner, blank lines and [DEBUG] chatter from captured output
+   */
+  private cleanGodotOutput(raw: string): string {
+    return raw
+      .split(/\r?\n/)
+      .map((l) => l.trimEnd())
+      .filter((l) => l.trim() !== '' && !l.startsWith('Godot Engine v') && !l.startsWith('[DEBUG]') && !l.startsWith('[INFO]'))
+      .join('\n');
+  }
+
+  /** Format cleaned output as a trailing "Output:" section, or nothing if empty */
+  private outputSection(raw: string): string {
+    const cleaned = this.cleanGodotOutput(raw);
+    return cleaned ? `\n\nOutput:\n${cleaned}` : '';
   }
 
   /**
@@ -776,6 +795,10 @@ class GodotServer {
                 type: 'string',
                 description: 'Type of the root node (e.g., Node2D, Node3D)',
               },
+              rootNodeName: {
+                type: 'string',
+                description: 'Name of the root node (optional, defaults to the scene file name in PascalCase, e.g. player_ship.tscn -> PlayerShip)',
+              },
             },
             required: ['projectPath', 'scenePath'],
           },
@@ -1098,21 +1121,23 @@ class GodotServer {
       const output: string[] = [];
       const errors: string[] = [];
 
-      process.stdout?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        output.push(...lines);
-        lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
-        });
-      });
+      // Chunks can end mid-line, so carry the partial tail over to the next chunk
+      const lineCollector = (target: string[], label: string) => {
+        let partial = '';
+        return (data: Buffer) => {
+          const parts = (partial + data.toString()).split(/\r?\n/);
+          partial = parts.pop() ?? '';
+          for (const line of parts) {
+            if (!line.trim()) continue;
+            target.push(line.trimEnd());
+            this.logDebug(`[Godot ${label}] ${line}`);
+          }
+        };
+      };
 
-      process.stderr?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        errors.push(...lines);
-        lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
-        });
-      });
+      process.stdout?.on('data', lineCollector(output, 'stdout'));
+
+      process.stderr?.on('data', lineCollector(errors, 'stderr'));
 
       process.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
@@ -1435,8 +1460,7 @@ class GodotServer {
       // Extract project name from project.godot file
       let projectName = basename(args.projectPath);
       try {
-        const fs = require('fs');
-        const projectFileContent = fs.readFileSync(projectFile, 'utf8');
+        const projectFileContent = readFileSync(projectFile, 'utf8');
         const configNameMatch = projectFileContent.match(/config\/name="([^"]+)"/);
         if (configNameMatch && configNameMatch[1]) {
           projectName = configNameMatch[1];
@@ -1522,6 +1546,7 @@ class GodotServer {
       const params = {
         scenePath: args.scenePath,
         rootNodeType,
+        ...(typeof args.rootNodeName === 'string' && args.rootNodeName ? { rootNodeName: args.rootNodeName } : {}),
       };
 
       // Execute the operation
@@ -1542,7 +1567,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Scene created successfully at: ${args.scenePath}\n\nOutput: ${stdout}`,
+            text: `Scene created successfully at: ${args.scenePath}${this.outputSection(stdout)}`,
           },
         ],
       };
@@ -1645,7 +1670,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Node '${args.nodeName}' of type '${args.nodeType}' added successfully to '${args.scenePath}'.\n\nOutput: ${stdout}`,
+            text: `Node '${args.nodeName}' of type '${args.nodeType}' added successfully to '${args.scenePath}'.${this.outputSection(stdout)}`,
           },
         ],
       };
@@ -1749,7 +1774,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Sprite loaded successfully with texture: ${args.texturePath}\n\nOutput: ${stdout}`,
+            text: `Sprite loaded successfully with texture: ${args.texturePath}${this.outputSection(stdout)}`,
           },
         ],
       };
@@ -1844,7 +1869,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `MeshLibrary exported successfully to: ${args.outputPath}\n\nOutput: ${stdout}`,
+            text: `MeshLibrary exported successfully to: ${args.outputPath}${this.outputSection(stdout)}`,
           },
         ],
       };
@@ -1943,7 +1968,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Scene saved successfully to: ${savePath}\n\nOutput: ${stdout}`,
+            text: `Scene saved successfully to: ${savePath}${this.outputSection(stdout)}`,
           },
         ],
       };
@@ -2048,11 +2073,26 @@ class GodotServer {
         );
       }
 
+      // The operation prints one JSON line with the result; find it among Godot's log lines
+      const jsonLine = stdout
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .reverse()
+        .find((l) => l.startsWith('{') && l.endsWith('}'));
+      if (!jsonLine) {
+        return this.createErrorResponse(
+          `Could not read UID for ${args.filePath}. Godot output:\n${this.cleanGodotOutput(stdout + '\n' + stderr)}`,
+          ['Ensure the file path is correct', 'Run update_project_uids to generate missing UIDs']
+        );
+      }
+      const result = JSON.parse(jsonLine);
       return {
         content: [
           {
             type: 'text',
-            text: `UID for ${args.filePath}: ${stdout.trim()}`,
+            text: result.uid
+              ? `UID for ${args.filePath}: ${result.uid}`
+              : `No UID for ${args.filePath}: ${result.message ?? 'unknown reason'}`,
           },
         ],
       };
@@ -2131,9 +2171,9 @@ class GodotServer {
       }
 
       // Prepare parameters for the operation (already in camelCase)
-      const params = {
-        projectPath: args.projectPath,
-      };
+      // Godot already runs with --path <project>, so the script scans res:// itself.
+      // (Passing the absolute path here used to turn into "res://C:\..." and match nothing.)
+      const params = {};
 
       // Execute the operation
       const { stdout, stderr } = await this.executeOperation('resave_resources', params, args.projectPath);
@@ -2152,7 +2192,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Project UIDs updated successfully.\n\nOutput: ${stdout}`,
+            text: `Project UIDs updated successfully.${this.outputSection(stdout)}`,
           },
         ],
       };

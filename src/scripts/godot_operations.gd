@@ -242,7 +242,11 @@ func create_scene(params):
         printerr("Check if the class is registered in ClassDB or available as a script")
         quit(1)
     
-    scene_root.name = "root"
+    # Name the root like the Godot editor does: "player_ship.tscn" -> "PlayerShip"
+    if params.has("root_node_name") and str(params.root_node_name) != "":
+        scene_root.name = str(params.root_node_name)
+    else:
+        scene_root.name = params.scene_path.get_file().get_basename().to_pascal_case()
     if debug_mode:
         print("Root node created with name: " + scene_root.name)
     
@@ -349,6 +353,7 @@ func create_scene(params):
             print("Save result: " + str(save_error) + " (OK=" + str(OK) + ")")
         
         if save_error == OK:
+            ensure_scene_uid(full_scene_path)
             # Only do extensive testing in debug mode
             if debug_mode:
                 # Wait a moment to ensure file system has time to complete the write
@@ -537,7 +542,7 @@ func add_node(params):
     if result == OK:
         if debug_mode:
             print("Saving scene to: " + absolute_scene_path)
-        var save_error = ResourceSaver.save(packed_scene, absolute_scene_path)
+        var save_error = save_preserving_uid(packed_scene, absolute_scene_path)
         if debug_mode:
             print("Save result: " + str(save_error) + " (OK=" + str(OK) + ")")
         if save_error == OK:
@@ -663,7 +668,7 @@ func load_sprite(params):
     if result == OK:
         if debug_mode:
             print("Saving scene to: " + full_scene_path)
-        var error = ResourceSaver.save(packed_scene, full_scene_path)
+        var error = save_preserving_uid(packed_scene, full_scene_path)
         if debug_mode:
             print("Save result: " + str(error) + " (OK=" + str(OK) + ")")
         
@@ -924,8 +929,20 @@ func get_uid(params):
     if debug_mode:
         print("UID file exists check: " + str(uid_check))
     
+    # Ask Godot first: works for scenes/resources (UID in the file header)
+    # and for scripts/shaders (UID in a .uid sidecar file).
+    var uid_id = existing_uid(file_path)
+    if uid_id != ResourceUID.INVALID_ID:
+        print(JSON.stringify({
+            "file": file_path,
+            "absolutePath": absolute_path,
+            "uid": ResourceUID.id_to_text(uid_id),
+            "exists": true
+        }))
+        return
+
     var f = FileAccess.open(uid_path, FileAccess.READ)
-    
+
     if f:
         # Read the UID content
         var uid_content = f.get_as_text()
@@ -958,13 +975,79 @@ func get_uid(params):
             print("UID result: " + JSON.stringify(result))
         print(JSON.stringify(result))
 
+# Read the uid="uid://..." from a text resource's first line (.tscn/.tres).
+# ResourceLoader.get_resource_uid() relies on the editor's UID cache, which a
+# headless --script run doesn't have, so read the header directly.
+func read_header_uid(path: String) -> int:
+    var f = FileAccess.open(path, FileAccess.READ)
+    if not f:
+        return ResourceUID.INVALID_ID
+    var header = f.get_line()
+    f.close()
+    var re = RegEx.new()
+    re.compile('uid="(uid://[^"]+)"')
+    var m = re.search(header)
+    if m:
+        return ResourceUID.text_to_id(m.get_string(1))
+    return ResourceUID.INVALID_ID
+
+# The UID a file already has, from its header or its .uid sidecar (or INVALID_ID)
+func existing_uid(path: String) -> int:
+    var id = read_header_uid(path)
+    if id != ResourceUID.INVALID_ID:
+        return id
+    if FileAccess.file_exists(path + ".uid"):
+        var text = FileAccess.get_file_as_string(path + ".uid").strip_edges()
+        if text.begins_with("uid://"):
+            return ResourceUID.text_to_id(text)
+    return ResourceLoader.get_resource_uid(path)
+
+# Save a resource without losing the UID its file already had
+func save_preserving_uid(resource: Resource, path: String) -> int:
+    var old_id = existing_uid(path) if FileAccess.file_exists(path) else ResourceUID.INVALID_ID
+    var err = ResourceSaver.save(resource, path)
+    if err != OK:
+        return err
+    if old_id != ResourceUID.INVALID_ID:
+        if read_header_uid(path) != old_id:
+            ResourceSaver.set_uid(path, old_id)
+    else:
+        ensure_scene_uid(path)
+    return OK
+
+# Give a saved scene/resource a UID in its header if it has none. Returns true if one was added.
+func ensure_scene_uid(path: String) -> bool:
+    if read_header_uid(path) != ResourceUID.INVALID_ID:
+        return false
+    var id = ResourceUID.create_id()
+    var err = ResourceSaver.set_uid(path, id)
+    if err != OK:
+        printerr("Failed to set UID for: " + path + ", error: " + str(err))
+        return false
+    ResourceUID.add_id(id, path)
+    print("Generated UID for: " + path + " -> " + ResourceUID.id_to_text(id))
+    return true
+
+# Create the "<file>.uid" sidecar used by scripts and shaders (Godot 4.4+)
+func write_uid_sidecar(path: String) -> int:
+    var id = ResourceUID.create_id()
+    var f = FileAccess.open(path + ".uid", FileAccess.WRITE)
+    if not f:
+        return FileAccess.get_open_error()
+    f.store_string(ResourceUID.id_to_text(id) + "\n")
+    f.close()
+    print("Generated UID for: " + path + " -> " + ResourceUID.id_to_text(id))
+    return OK
+
 # Resave all resources to update UID references
 func resave_resources(params):
     print("Resaving all resources to update UID references...")
     
     # Get project path if provided
     var project_path = "res://"
-    if params.has("project_path"):
+    # Only a project-relative subfolder makes sense here; an absolute OS path is the
+    # project root itself (Godot was started with --path), so keep res://.
+    if params.has("project_path") and not str(params.project_path).is_absolute_path():
         project_path = params.project_path
         if not project_path.begins_with("res://"):
             project_path = "res://" + project_path
@@ -984,6 +1067,8 @@ func resave_resources(params):
     # Resave each scene
     var success_count = 0
     var error_count = 0
+    var missing_uids = 0
+    var generated_uids = 0
     
     for scene_path in scenes:
         if debug_mode:
@@ -1004,12 +1089,17 @@ func resave_resources(params):
         if scene:
             if debug_mode:
                 print("Scene loaded successfully, saving...")
-            var error = ResourceSaver.save(scene, scene_path)
+            var had_uid = read_header_uid(scene_path) != ResourceUID.INVALID_ID
+            var error = save_preserving_uid(scene, scene_path)
             if debug_mode:
                 print("Save result: " + str(error) + " (OK=" + str(OK) + ")")
             
             if error == OK:
                 success_count += 1
+                # Headless --script runs don't get UIDs from the editor's filesystem scan,
+                # so give scenes without one a fresh UID explicitly.
+                if not had_uid:
+                    generated_uids += 1
                 if debug_mode:
                     print("Scene saved successfully: " + scene_path)
                 
@@ -1034,9 +1124,6 @@ func resave_resources(params):
         print("Found " + str(scripts.size()) + " scripts/shaders")
     
     # Check for missing .uid files
-    var missing_uids = 0
-    var generated_uids = 0
-    
     for script_path in scripts:
         if debug_mode:
             print("Checking UID for: " + script_path)
@@ -1052,10 +1139,11 @@ func resave_resources(params):
             if debug_mode:
                 print("Missing UID file for: " + script_path + ", generating...")
             
-            # Force a save to generate UID
+            # Write the .uid sidecar ourselves; ResourceSaver.save doesn't create
+            # one when the editor filesystem isn't running (headless --script).
             var res = load(script_path)
             if res:
-                var error = ResourceSaver.save(res, script_path)
+                var error = write_uid_sidecar(script_path)
                 if debug_mode:
                     print("Save result: " + str(error) + " (OK=" + str(OK) + ")")
                 
@@ -1161,7 +1249,7 @@ func save_scene(params):
     if result == OK:
         if debug_mode:
             print("Saving scene to: " + save_path)
-        var error = ResourceSaver.save(packed_scene, save_path)
+        var error = save_preserving_uid(packed_scene, save_path)
         if debug_mode:
             print("Save result: " + str(error) + " (OK=" + str(OK) + ")")
         

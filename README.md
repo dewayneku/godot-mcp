@@ -74,6 +74,11 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Load sprites and textures into Sprite2D nodes
   - Export 3D scenes as MeshLibrary resources for GridMap
   - Save scenes with options for creating variants
+  - Read a scene's node tree with each node's type, script, groups and changed properties (`get_scene_tree`)
+  - Set node properties with automatic type conversion: `[100, 200]` → `Vector2`, `"#ff8800"` → `Color`, `"res://..."` → resource (`set_node_properties`)
+  - Attach scripts to nodes, writing the script file if needed; refuses scripts with errors or the wrong base type (`attach_script`)
+- **Script Checking**: Find GDScript parse/compile errors with file and line, without running the game (`validate_scripts`)
+- **Screenshots**: Run the game briefly and get the last frame back as an image (`take_screenshot`, uses Godot's Movie Maker mode)
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
@@ -200,6 +205,7 @@ For any MCP-compatible client, use this configuration:
 |----------|-------------|
 | `GODOT_PATH` | Path to the Godot executable (overrides automatic detection) |
 | `DEBUG` | Set to `"true"` to enable detailed server-side debug logging |
+| `GODOT_DEBUG` | Set to `"true"` to include verbose logging from the Godot-side operations script in tool results |
 
 <details>
 <summary><strong>Building from Source</strong></summary>
@@ -212,6 +218,12 @@ npm run build
 ```
 
 Then point your MCP client to `build/index.js` instead of using `npx`.
+
+To check everything end to end against your Godot install (creates a throwaway project in your temp folder):
+
+```bash
+GODOT_PATH=/path/to/godot node scripts/smoke-test.mjs
+```
 
 </details>
 

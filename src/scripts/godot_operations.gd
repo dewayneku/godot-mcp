@@ -3,6 +3,8 @@ extends SceneTree
 
 # Debug mode flag
 var debug_mode = false
+# Set by fail(); keeps the final quit() from overwriting the error exit code
+var has_failed = false
 
 func _init():
     var args = OS.get_cmdline_args()
@@ -50,9 +52,11 @@ func _init():
         log_error("JSON Error: " + json.get_error_message() + " at line " + str(json.get_error_line()))
         quit(1)
     
-    if not params:
-        log_error("Failed to parse JSON parameters: " + params_json)
+    # An empty {} is valid (and falsy in GDScript), so only reject non-objects
+    if typeof(params) != TYPE_DICTIONARY:
+        log_error("JSON parameters must be an object: " + params_json)
         quit(1)
+        return
     
     log_info("Executing operation: " + operation)
     
@@ -71,11 +75,21 @@ func _init():
             get_uid(params)
         "resave_resources":
             resave_resources(params)
+        "get_scene_tree":
+            get_scene_tree(params)
+        "set_node_properties":
+            set_node_properties(params)
+        "attach_script":
+            attach_script(params)
+        "validate_scripts":
+            validate_scripts(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
-    
-    quit()
+            return
+
+    if not has_failed:
+        quit()
 
 # Logging functions
 func log_debug(message):
@@ -1272,3 +1286,338 @@ func save_scene(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+# ---------------------------------------------------------------------------
+# Structured results
+#
+# Newer operations print exactly one "MCP_RESULT:<json>" line on success, or
+# "MCP_ERROR:<message>" lines on stderr on failure, so the server can parse
+# results reliably instead of scraping log text.
+# ---------------------------------------------------------------------------
+
+func emit_result(data) -> void:
+    print("MCP_RESULT:" + JSON.stringify(data))
+
+func fail(message: String) -> void:
+    printerr("MCP_ERROR:" + message)
+    has_failed = true
+    quit(1)
+
+func to_res_path(path: String) -> String:
+    return path if path.begins_with("res://") else "res://" + path
+
+# Load and instantiate a scene; returns null (after reporting) on failure
+func open_scene(scene_path: String) -> Node:
+    var res_path = to_res_path(scene_path)
+    if not FileAccess.file_exists(res_path):
+        fail("Scene does not exist: " + res_path)
+        return null
+    var packed = load(res_path) as PackedScene
+    if packed == null:
+        fail("Not a loadable scene: " + res_path)
+        return null
+    var root = packed.instantiate(PackedScene.GEN_EDIT_STATE_INSTANCE)
+    if root == null:
+        fail("Could not instantiate scene: " + res_path)
+    return root
+
+# Pack and save a scene back to its file, keeping its UID
+func store_scene(root: Node, scene_path: String) -> bool:
+    var packed = PackedScene.new()
+    var err = packed.pack(root)
+    if err != OK:
+        fail("Failed to pack scene: " + error_string(err))
+        return false
+    err = save_preserving_uid(packed, to_res_path(scene_path))
+    if err != OK:
+        fail("Failed to save scene: " + error_string(err))
+        return false
+    return true
+
+# Find a node by path relative to the scene root. "", "." and "root" mean the root;
+# a leading "root/" or the root's own name is accepted too.
+func find_scene_node(root: Node, node_path: String) -> Node:
+    var p = node_path.strip_edges()
+    if p == "" or p == "." or p == "root" or p == String(root.name):
+        return root
+    if p.begins_with("root/"):
+        p = p.substr(5)
+    elif p.begins_with(String(root.name) + "/"):
+        p = p.substr(String(root.name).length() + 1)
+    return root.get_node_or_null(NodePath(p))
+
+# Make a value JSON-friendly; Godot types become their GDScript literal text
+func describe_value(value):
+    match typeof(value):
+        TYPE_NIL, TYPE_BOOL, TYPE_INT, TYPE_STRING:
+            return value
+        TYPE_FLOAT:
+            return value if is_finite(value) else str(value)
+        TYPE_STRING_NAME, TYPE_NODE_PATH:
+            return str(value)
+        TYPE_OBJECT:
+            if value == null:
+                return null
+            if value is Resource:
+                if value.resource_path != "" and not value.resource_path.contains("::"):
+                    return value.resource_path
+                return "<" + value.get_class() + ">"
+            return "<" + value.get_class() + ">"
+        _:
+            var text = var_to_str(value)
+            return text if text.length() <= 300 else text.substr(0, 300) + "..."
+
+# Properties that differ from the class default (what the editor would save)
+func changed_properties(node: Node) -> Dictionary:
+    var out = {}
+    var cls = node.get_class()
+    for prop in node.get_property_list():
+        var usage = prop["usage"]
+        if not (usage & PROPERTY_USAGE_STORAGE) or (usage & PROPERTY_USAGE_INTERNAL):
+            continue
+        var name = prop["name"]
+        if name in ["script", "owner", "unique_name_in_owner"] or name.begins_with("metadata/"):
+            continue
+        var value = node.get(name)
+        if ClassDB.class_exists(cls):
+            var default_value = ClassDB.class_get_property_default_value(cls, name)
+            if typeof(default_value) == typeof(value) and default_value == value:
+                continue
+            if default_value == null and value == null:
+                continue
+        out[name] = describe_value(value)
+    return out
+
+func describe_node(node: Node, root: Node, include_properties: bool, depth: int, max_depth: int) -> Dictionary:
+    var info = {
+        "name": String(node.name),
+        "type": node.get_class(),
+        "path": "." if node == root else str(root.get_path_to(node)),
+    }
+    var script = node.get_script()
+    if script:
+        info["script"] = script.resource_path
+    if node != root and node.scene_file_path != "":
+        info["instance_of"] = node.scene_file_path
+    var groups = []
+    for g in node.get_groups():
+        if not String(g).begins_with("_"):
+            groups.append(String(g))
+    if groups.size() > 0:
+        info["groups"] = groups
+    if include_properties:
+        var props = changed_properties(node)
+        if props.size() > 0:
+            info["properties"] = props
+    var children = []
+    # Don't descend into instanced sub-scenes; their insides live in their own file
+    if (node == root or node.scene_file_path == "") and (max_depth < 0 or depth < max_depth):
+        for child in node.get_children():
+            if child.owner == root or child.owner == null:
+                children.append(describe_node(child, root, include_properties, depth + 1, max_depth))
+    if children.size() > 0:
+        info["children"] = children
+    return info
+
+# Read a scene's node tree
+func get_scene_tree(params):
+    if not params.has("scene_path"):
+        fail("scene_path is required")
+        return
+    var root = open_scene(params.scene_path)
+    if root == null:
+        return
+    var start = root
+    if params.has("node_path") and str(params.node_path) != "":
+        start = find_scene_node(root, str(params.node_path))
+        if start == null:
+            fail("Node not found: " + str(params.node_path))
+            return
+    var include_properties = params.get("include_properties", true)
+    var max_depth = int(params.get("max_depth", -1))
+    var tree = describe_node(start, root, include_properties, 0, max_depth)
+    if start != root:
+        tree["path"] = str(root.get_path_to(start))
+    emit_result(tree)
+    root.free()
+
+# Turn a JSON value into what the property expects, using the property's current type:
+#   "res://..."            -> loaded resource
+#   [x, y] / {"x":..}      -> Vector2/Vector3/Color/... when the property is one
+#   "Vector2(1, 2)" etc.   -> parsed as a GDScript literal (str_to_var)
+func coerce_value(current, value):
+    var target = typeof(current)
+    if typeof(value) == TYPE_STRING:
+        var s: String = value
+        if s.begins_with("res://") or s.begins_with("uid://"):
+            if not ResourceLoader.exists(s):
+                if FileAccess.file_exists(s):
+                    return [false, "Resource not imported yet: " + s + " (open the project in the editor once)"]
+                return [false, "Resource not found: " + s]
+            return [true, load(s)]
+        if target == TYPE_STRING or target == TYPE_STRING_NAME:
+            return [true, s]
+        if target == TYPE_NODE_PATH:
+            return [true, NodePath(s)]
+        if target == TYPE_COLOR and (s.begins_with("#") or Color.html_is_valid(s)):
+            return [true, Color.html(s)]
+        if target == TYPE_COLOR and not s.contains("("):
+            return [true, Color.from_string(s, Color.BLACK)]
+        var parsed = str_to_var(s)
+        if parsed != null:
+            return [true, parsed]
+        return [true, s]
+    if typeof(value) == TYPE_ARRAY:
+        var a: Array = value
+        match target:
+            TYPE_VECTOR2:
+                return [true, Vector2(a[0], a[1])]
+            TYPE_VECTOR2I:
+                return [true, Vector2i(a[0], a[1])]
+            TYPE_VECTOR3:
+                return [true, Vector3(a[0], a[1], a[2])]
+            TYPE_VECTOR3I:
+                return [true, Vector3i(a[0], a[1], a[2])]
+            TYPE_VECTOR4:
+                return [true, Vector4(a[0], a[1], a[2], a[3])]
+            TYPE_COLOR:
+                return [true, Color(a[0], a[1], a[2], a[3] if a.size() > 3 else 1.0)]
+            TYPE_RECT2:
+                return [true, Rect2(a[0], a[1], a[2], a[3])]
+    if typeof(value) == TYPE_DICTIONARY:
+        var d: Dictionary = value
+        match target:
+            TYPE_VECTOR2:
+                return [true, Vector2(d.get("x", 0), d.get("y", 0))]
+            TYPE_VECTOR2I:
+                return [true, Vector2i(d.get("x", 0), d.get("y", 0))]
+            TYPE_VECTOR3:
+                return [true, Vector3(d.get("x", 0), d.get("y", 0), d.get("z", 0))]
+            TYPE_COLOR:
+                return [true, Color(d.get("r", 0), d.get("g", 0), d.get("b", 0), d.get("a", 1))]
+    if typeof(value) == TYPE_FLOAT and target == TYPE_INT:
+        return [true, int(value)]
+    return [true, value]
+
+func has_property(node: Object, name: String) -> bool:
+    for prop in node.get_property_list():
+        if prop["name"] == name:
+            return true
+    return false
+
+# Set one or more properties on a node in a scene
+func set_node_properties(params):
+    if not params.has("scene_path") or not params.has("properties"):
+        fail("scene_path and properties are required")
+        return
+    var root = open_scene(params.scene_path)
+    if root == null:
+        return
+    var node = find_scene_node(root, str(params.get("node_path", ".")))
+    if node == null:
+        fail("Node not found: " + str(params.get("node_path", ".")))
+        return
+    var props = params.properties
+    if typeof(props) == TYPE_STRING:
+        props = JSON.parse_string(props)
+    if typeof(props) != TYPE_DICTIONARY:
+        fail("properties must be an object of name -> value")
+        return
+    var applied = {}
+    var errors = []
+    for name in props:
+        if name == "script":
+            errors.append("Use attach_script to set scripts")
+            continue
+        if not has_property(node, name):
+            errors.append("'" + name + "' is not a property of " + node.get_class())
+            continue
+        var coerced = coerce_value(node.get(name), props[name])
+        if not coerced[0]:
+            errors.append(name + ": " + coerced[1])
+            continue
+        node.set(name, coerced[1])
+        applied[name] = describe_value(node.get(name))
+    if errors.size() > 0:
+        root.free()
+        fail("No changes saved. " + "; ".join(errors))
+        return
+    if store_scene(root, params.scene_path):
+        emit_result({"node": "." if node == root else str(root.get_path_to(node)), "applied": applied})
+    root.free()
+
+const SCRIPT_TEMPLATE = "extends %s\n\n\nfunc _ready() -> void:\n\tpass\n\n\nfunc _process(delta: float) -> void:\n\tpass\n"
+
+# Attach a script to a node, creating the script file if needed
+func attach_script(params):
+    if not params.has("scene_path") or not params.has("script_path"):
+        fail("scene_path and script_path are required")
+        return
+    var script_path = to_res_path(str(params.script_path))
+    if not script_path.ends_with(".gd"):
+        fail("script_path must be a .gd file")
+        return
+    var root = open_scene(params.scene_path)
+    if root == null:
+        return
+    var node = find_scene_node(root, str(params.get("node_path", ".")))
+    if node == null:
+        fail("Node not found: " + str(params.get("node_path", ".")))
+        return
+
+    var created = false
+    var content = str(params.get("script_content", ""))
+    if content != "" or not FileAccess.file_exists(script_path):
+        if content == "":
+            content = SCRIPT_TEMPLATE % node.get_class()
+        DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(script_path.get_base_dir()))
+        var f = FileAccess.open(script_path, FileAccess.WRITE)
+        if f == null:
+            fail("Cannot write script: " + script_path + " (" + error_string(FileAccess.get_open_error()) + ")")
+            return
+        f.store_string(content)
+        f.close()
+        created = true
+        if not FileAccess.file_exists(script_path + ".uid"):
+            write_uid_sidecar(script_path)
+
+    var script = ResourceLoader.load(script_path, "", ResourceLoader.CACHE_MODE_IGNORE) as Script
+    if script == null or not script.can_instantiate():
+        root.free()
+        fail("Script has errors, not attached: " + script_path + " (run validate_scripts for details)")
+        return
+    var base = script.get_instance_base_type()
+    if not ClassDB.is_parent_class(node.get_class(), base):
+        var message = "Script extends " + str(base) + " but node '" + String(node.name) + "' is a " + node.get_class()
+        root.free()
+        fail(message)
+        return
+    node.set_script(script)
+    if store_scene(root, params.scene_path):
+        emit_result({
+            "node": "." if node == root else str(root.get_path_to(node)),
+            "script": script_path,
+            "created": created,
+        })
+    root.free()
+
+# Check scripts for parse/compile errors. Error details go to stderr (Godot prints
+# "SCRIPT ERROR: ..." / "at: ... (res://file.gd:LINE)"); the server matches them up.
+func validate_scripts(params):
+    var paths = []
+    if params.has("script_paths") and typeof(params.script_paths) == TYPE_ARRAY and params.script_paths.size() > 0:
+        for p in params.script_paths:
+            paths.append(to_res_path(str(p)))
+    else:
+        paths = find_files("res://", ".gd")
+    var results = []
+    for path in paths:
+        if path.begins_with("res://addons/") and not params.get("include_addons", false):
+            continue
+        if not FileAccess.file_exists(path):
+            results.append({"path": path, "ok": false, "missing": true})
+            continue
+        print("MCP_CHECKING:" + path)
+        var script = ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_IGNORE) as Script
+        results.append({"path": path, "ok": script != null and script.can_instantiate()})
+    emit_result(results)

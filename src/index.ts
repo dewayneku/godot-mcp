@@ -9,7 +9,8 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync, readFileSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -91,6 +92,12 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'script_path': 'scriptPath',
+    'script_paths': 'scriptPaths',
+    'script_content': 'scriptContent',
+    'include_properties': 'includeProperties',
+    'include_addons': 'includeAddons',
+    'max_depth': 'maxDepth',
   };
 
   /**
@@ -946,6 +953,86 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'get_scene_tree',
+          description:
+            'Read a scene\'s node tree: each node\'s name, type, path, script, groups, instanced sub-scenes, and the properties that differ from their defaults (Godot types shown as GDScript literals like Vector2(10, 20))',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project (e.g. "main.tscn")' },
+              nodePath: { type: 'string', description: 'Only return this node and its children (path from the scene root, e.g. "Player/Sprite")' },
+              includeProperties: { type: 'boolean', description: 'Include changed properties (default true)' },
+              maxDepth: { type: 'number', description: 'Limit how deep to descend (default: unlimited)' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'set_node_properties',
+          description:
+            'Set properties on a node in a scene and save it. Values are converted to the property\'s type: arrays/objects for vectors and colors ([100, 200], {"x":1,"y":2}), "#ff0000" for colors, "res://..." to load a resource, or GDScript literals as strings ("Vector2(1, 2)", "Rect2(0, 0, 32, 32)")',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              nodePath: { type: 'string', description: 'Node path from the scene root ("." or omit for the root)' },
+              properties: {
+                type: 'object',
+                description: 'Property name -> value, e.g. {"position": [100, 200], "scale": [2, 2], "modulate": "#ff8800"}',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'properties'],
+          },
+        },
+        {
+          name: 'attach_script',
+          description:
+            'Attach a GDScript to a node in a scene. Writes scriptContent to scriptPath if given, creates a starter script if the file doesn\'t exist, and refuses scripts that have errors or extend the wrong node type',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              nodePath: { type: 'string', description: 'Node path from the scene root ("." or omit for the root)' },
+              scriptPath: { type: 'string', description: 'Script file, relative to the project (e.g. "scripts/player.gd")' },
+              scriptContent: { type: 'string', description: 'Optional source to write to scriptPath (overwrites it)' },
+            },
+            required: ['projectPath', 'scenePath', 'scriptPath'],
+          },
+        },
+        {
+          name: 'validate_scripts',
+          description:
+            'Check GDScript files for parse and compile errors without running the game. Reports file, line and message for each error. Checks every .gd in the project (except addons/) unless scriptPaths is given',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scriptPaths: { type: 'array', items: { type: 'string' }, description: 'Only check these scripts (relative to the project)' },
+              includeAddons: { type: 'boolean', description: 'Also check scripts under addons/ (default false)' },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'take_screenshot',
+          description:
+            'Run the game for a short time and return a screenshot of the last frame as an image. Runs the real game (autoloads included) at a fixed 10 fps game clock, so "seconds" is game time',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scene: { type: 'string', description: 'Scene to run (default: the project\'s main scene)' },
+              seconds: { type: 'number', description: 'Game time to run before capturing (default 1, max 30)' },
+              width: { type: 'number', description: 'Window width (optional, needs height)' },
+              height: { type: 'number', description: 'Window height (optional, needs width)' },
+            },
+            required: ['projectPath'],
+          },
+        },
       ],
     }));
 
@@ -981,6 +1068,16 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'get_scene_tree':
+          return await this.handleGetSceneTree(request.params.arguments);
+        case 'set_node_properties':
+          return await this.handleSetNodeProperties(request.params.arguments);
+        case 'attach_script':
+          return await this.handleAttachScript(request.params.arguments);
+        case 'validate_scripts':
+          return await this.handleValidateScripts(request.params.arguments);
+        case 'take_screenshot':
+          return await this.handleTakeScreenshot(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -988,6 +1085,325 @@ class GodotServer {
           );
       }
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Helpers for the scene/script/screenshot tools
+  // -------------------------------------------------------------------------
+
+  /** Ensure Godot is found and projectPath is a real project; returns an error response or null */
+  private async checkProject(projectPath: string): Promise<any | null> {
+    if (!projectPath || !this.validatePath(projectPath)) {
+      return this.createErrorResponse('Missing or invalid projectPath', ['Provide the Godot project directory (no "..")']);
+    }
+    if (!existsSync(join(projectPath, 'project.godot'))) {
+      return this.createErrorResponse(`Not a valid Godot project: ${projectPath}`, [
+        'Ensure the path points to a directory containing a project.godot file',
+        'Use list_projects to find valid Godot projects',
+      ]);
+    }
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse('Could not find a valid Godot executable path', [
+          'Set GODOT_PATH to your Godot executable',
+        ]);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Run Godot's import step (what the editor does on open) when the project has never
+   * been imported, or when a referenced file such as a texture has no .import file yet.
+   * Returns a note for the response, or '' if nothing was needed.
+   */
+  private async ensureImported(projectPath: string, resPaths: string[] = []): Promise<string> {
+    // Text resources and scripts load without importing
+    const needsImport = (p: string) =>
+      !/\.(tscn|tres|gd|gdshader|res|scn|cfg|json|txt)$/i.test(p) &&
+      existsSync(join(projectPath, p.replace(/^res:\/\//, ''))) &&
+      !existsSync(join(projectPath, p.replace(/^res:\/\//, '') + '.import'));
+    const neverImported = !existsSync(join(projectPath, '.godot', 'global_script_class_cache.cfg'));
+    if (!neverImported && !resPaths.some(needsImport)) return '';
+    try {
+      await execFileAsync(this.godotPath!, ['--headless', '--path', projectPath, '--import'], { timeout: 180000 });
+      return '(Ran Godot\'s import step first, like opening the project in the editor.)';
+    } catch {
+      return '(Tried to run Godot\'s import step first but it failed; new assets or class_name types may not resolve.)';
+    }
+  }
+
+  /**
+   * Run an operation that reports through "MCP_RESULT:<json>" / "MCP_ERROR:<message>" lines
+   */
+  private async runStructuredOperation(
+    operation: string,
+    params: OperationParams,
+    projectPath: string
+  ): Promise<{ ok: true; data: any; stderr: string } | { ok: false; error: string; stderr: string }> {
+    const { stdout, stderr } = await this.executeOperation(operation, params, projectPath);
+    const errors = stderr
+      .split(/\r?\n/)
+      .filter((l) => l.startsWith('MCP_ERROR:'))
+      .map((l) => l.slice('MCP_ERROR:'.length));
+    if (errors.length > 0) {
+      return { ok: false, error: errors.join('\n'), stderr };
+    }
+    const resultLine = stdout.split(/\r?\n/).find((l) => l.startsWith('MCP_RESULT:'));
+    if (!resultLine) {
+      return {
+        ok: false,
+        error: `Godot did not return a result.\n${this.cleanGodotOutput(stdout + '\n' + stderr)}`,
+        stderr,
+      };
+    }
+    return { ok: true, data: JSON.parse(resultLine.slice('MCP_RESULT:'.length)), stderr };
+  }
+
+  private textResponse(text: string) {
+    return { content: [{ type: 'text', text }] };
+  }
+
+  /**
+   * Turn Godot's "SCRIPT ERROR: ..." + "at: ... (res://file.gd:LINE)" pairs into
+   * de-duplicated { file, line, message } entries
+   */
+  private parseScriptErrors(stderr: string): { file: string; line: number | null; message: string }[] {
+    const lines = stderr.split(/\r?\n/);
+    const seen = new Set<string>();
+    const found: { file: string; line: number | null; message: string }[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^(?:SCRIPT )?ERROR: (.*)$/);
+      if (!m) continue;
+      const message = m[1].replace(/^(Parse Error|Compile Error): /, '').trim();
+      const at = (lines[i + 1] ?? '').match(/at: .*\((res:\/\/[^:)]+)(?::(\d+))?\)/);
+      if (!at) continue;
+      // Skip Godot's generic follow-up ("Failed to load script ... Parse error")
+      if (/^Failed to load script/.test(message)) continue;
+      const file = at[1];
+      const line = at[2] ? parseInt(at[2], 10) : null;
+      // Godot sometimes reports the same problem twice with different wording; keep one per line
+      const key = `${file}:${line}`;
+      const exact = `${key}:${message}`;
+      if (seen.has(exact)) continue;
+      if (seen.has(key) && /Cannot assign a value of type/.test(message)) continue;
+      seen.add(exact);
+      seen.add(key);
+      found.push({ file, line, message });
+    }
+    return found;
+  }
+
+  /**
+   * Handle the get_scene_tree tool
+   */
+  private async handleGetSceneTree(args: any) {
+    args = this.normalizeParameters(args);
+    const bad = await this.checkProject(args.projectPath);
+    if (bad) return bad;
+    if (!args.scenePath || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Missing or invalid scenePath', ['e.g. "main.tscn" or "res://scenes/player.tscn"']);
+    }
+    try {
+      const params: OperationParams = { scenePath: args.scenePath };
+      if (args.nodePath) params.nodePath = args.nodePath;
+      if (args.includeProperties === false) params.includeProperties = false;
+      if (typeof args.maxDepth === 'number') params.maxDepth = args.maxDepth;
+      const r = await this.runStructuredOperation('get_scene_tree', params, args.projectPath);
+      if (!r.ok) return this.createErrorResponse(`Failed to read scene: ${r.error}`);
+      return this.textResponse(JSON.stringify(r.data, null, 2));
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to read scene: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Handle the set_node_properties tool
+   */
+  private async handleSetNodeProperties(args: any) {
+    // properties keys are Godot property names: don't run them through normalizeParameters
+    const properties = args?.properties;
+    args = this.normalizeParameters(args);
+    const bad = await this.checkProject(args.projectPath);
+    if (bad) return bad;
+    if (!args.scenePath || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Missing or invalid scenePath');
+    }
+    if (!properties || typeof properties !== 'object' || Array.isArray(properties) || Object.keys(properties).length === 0) {
+      return this.createErrorResponse('properties must be a non-empty object', [
+        'e.g. {"position": [100, 200], "modulate": "#ff0000", "texture": "res://icon.svg"}',
+      ]);
+    }
+    try {
+      const resPaths = Object.values(properties).filter(
+        (v): v is string => typeof v === 'string' && v.startsWith('res://')
+      );
+      const note = await this.ensureImported(args.projectPath, resPaths);
+      const r = await this.runStructuredOperation(
+        'set_node_properties',
+        // Sent as a JSON string so key conversion never touches property names
+        { scenePath: args.scenePath, nodePath: args.nodePath ?? '.', properties: JSON.stringify(properties) },
+        args.projectPath
+      );
+      if (!r.ok) return this.createErrorResponse(`Failed to set properties: ${r.error}`);
+      return this.textResponse(
+        `Updated ${r.data.node === '.' ? 'the root node' : r.data.node} in ${args.scenePath}:\n${JSON.stringify(r.data.applied, null, 2)}${note ? '\n' + note : ''}`
+      );
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to set properties: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Handle the attach_script tool
+   */
+  private async handleAttachScript(args: any) {
+    args = this.normalizeParameters(args);
+    const bad = await this.checkProject(args.projectPath);
+    if (bad) return bad;
+    if (!args.scenePath || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Missing or invalid scenePath');
+    }
+    if (!args.scriptPath || !this.validatePath(args.scriptPath) || !/\.gd$/.test(args.scriptPath)) {
+      return this.createErrorResponse('Missing or invalid scriptPath', ['Must be a project-relative .gd path, e.g. "scripts/player.gd"']);
+    }
+    try {
+      const params: OperationParams = {
+        scenePath: args.scenePath,
+        nodePath: args.nodePath ?? '.',
+        scriptPath: args.scriptPath,
+      };
+      if (typeof args.scriptContent === 'string') params.scriptContent = args.scriptContent;
+      const r = await this.runStructuredOperation('attach_script', params, args.projectPath);
+      if (!r.ok) {
+        const details = this.parseScriptErrors(r.stderr)
+          .map((e) => `  ${e.file}${e.line ? ':' + e.line : ''}: ${e.message}`)
+          .join('\n');
+        return this.createErrorResponse(`Failed to attach script: ${r.error}${details ? '\n' + details : ''}`);
+      }
+      return this.textResponse(
+        `${r.data.created ? 'Wrote' : 'Used existing'} ${r.data.script} and attached it to ${r.data.node === '.' ? 'the root node' : r.data.node} in ${args.scenePath}.`
+      );
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to attach script: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Handle the validate_scripts tool
+   */
+  private async handleValidateScripts(args: any) {
+    args = this.normalizeParameters(args);
+    const bad = await this.checkProject(args.projectPath);
+    if (bad) return bad;
+    const scriptPaths: string[] = Array.isArray(args.scriptPaths) ? args.scriptPaths : [];
+    if (scriptPaths.some((p) => typeof p !== 'string' || !this.validatePath(p))) {
+      return this.createErrorResponse('Invalid entry in scriptPaths');
+    }
+    try {
+      // class_name lookups need the project's global class cache, which only exists
+      // after the editor has imported the project once. Build it if it's missing.
+      const notes: string[] = [];
+      const importNote = await this.ensureImported(args.projectPath);
+      if (importNote) notes.push(importNote);
+      const r = await this.runStructuredOperation(
+        'validate_scripts',
+        { scriptPaths, includeAddons: args.includeAddons === true },
+        args.projectPath
+      );
+      if (!r.ok) return this.createErrorResponse(`Failed to validate scripts: ${r.error}`);
+      const results: { path: string; ok: boolean; missing?: boolean }[] = r.data;
+      const errors = this.parseScriptErrors(r.stderr);
+      const failed = results.filter((s) => !s.ok);
+      const lines: string[] = [];
+      if (failed.length === 0) {
+        lines.push(`All ${results.length} script(s) OK.`);
+      } else {
+        lines.push(`${failed.length} of ${results.length} script(s) have errors:`);
+        for (const s of failed) {
+          if (s.missing) {
+            lines.push(`\n${s.path}: file not found`);
+            continue;
+          }
+          lines.push(`\n${s.path}`);
+          const own = errors.filter((e) => e.file === s.path);
+          if (own.length === 0) lines.push('  (failed to load; see errors in scripts it depends on)');
+          for (const e of own) lines.push(`  line ${e.line ?? '?'}: ${e.message}`);
+        }
+        // Errors in dependencies that weren't in the checked list
+        const extra = errors.filter((e) => !results.some((s) => s.path === e.file));
+        for (const e of extra) lines.push(`\n${e.file}\n  line ${e.line ?? '?'}: ${e.message}`);
+      }
+      lines.push(...notes);
+      return this.textResponse(lines.join('\n'));
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to validate scripts: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Handle the take_screenshot tool: run the game in Movie Maker mode for a short
+   * time and return the last frame. This runs the real game (autoloads included).
+   */
+  private async handleTakeScreenshot(args: any) {
+    args = this.normalizeParameters(args);
+    const bad = await this.checkProject(args.projectPath);
+    if (bad) return bad;
+    if (args.scene && !this.validatePath(args.scene)) {
+      return this.createErrorResponse('Invalid scene path');
+    }
+    const seconds = Math.min(Math.max(Number(args.seconds ?? 1), 0.1), 30);
+    const fps = 10;
+    const frames = Math.max(1, Math.round(seconds * fps));
+    const outDir = mkdtempSync(join(tmpdir(), 'godot-mcp-shot-'));
+    try {
+      const cmd = [
+        '--path', args.projectPath,
+        '--write-movie', join(outDir, 'frame.png'),
+        '--fixed-fps', String(fps),
+        '--quit-after', String(frames),
+      ];
+      if (args.width && args.height) cmd.push('--resolution', `${Math.round(args.width)}x${Math.round(args.height)}`);
+      if (args.scene) cmd.push(args.scene.startsWith('res://') ? args.scene : `res://${args.scene}`);
+
+      let stderr = '';
+      try {
+        const r = await execFileAsync(this.godotPath!, cmd, { timeout: 30000 + seconds * 5000, maxBuffer: 16 * 1024 * 1024 });
+        stderr = r.stderr ?? '';
+      } catch (error: any) {
+        stderr = error?.stderr ?? '';
+        if (error?.killed) {
+          return this.createErrorResponse('Godot took too long to render the frames and was stopped');
+        }
+      }
+      const pngs = readdirSync(outDir).filter((f) => f.endsWith('.png')).sort();
+      const errors = this.parseScriptErrors(stderr);
+      const errorText = errors.length
+        ? '\nErrors while running:\n' + errors.map((e) => `  ${e.file}:${e.line ?? '?'}: ${e.message}`).join('\n')
+        : '';
+      if (pngs.length === 0) {
+        return this.createErrorResponse(
+          `No frame was captured.${errorText}\n${this.cleanGodotOutput(stderr).split('\n').slice(-15).join('\n')}`,
+          ['Check that the project has a main scene, or pass scene', 'Run validate_scripts to look for errors']
+        );
+      }
+      const last = pngs[pngs.length - 1];
+      const data = readFileSync(join(outDir, last)).toString('base64');
+      return {
+        content: [
+          { type: 'image', data, mimeType: 'image/png' },
+          {
+            type: 'text',
+            text: `Frame ${pngs.length} of ${frames} (${(pngs.length / fps).toFixed(1)}s of game time${args.scene ? `, scene ${args.scene}` : ''}).${errorText}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to take screenshot: ${error?.message || 'Unknown error'}`);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
   }
 
   /**
